@@ -15,10 +15,74 @@ use super::SerdeValue;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone)]
-enum Urlish {
-    Url(Url),
-    Str(String),
+#[derive(Clone)]
+struct ParsedUrl {
+    /// The original plain string when the Request is instantiated using a `String`.
+    /// None if the Request is instantiated with a `Url`.
+    plain_str: Option<String>,
+    /// Parse result, regardless of whether `plain_str` has a value or not.
+    parse_result: std::result::Result<Url, url::ParseError>,
+    /// This is necessary because Url::query_pairs() gives us Cow<String>
+    /// and Cow is not something we want to expose in our API.
+    query_params: Vec<(String, String)>,
+}
+
+impl ParsedUrl {
+    fn as_str(&self) -> &str {
+        if let Some(s) = &self.plain_str {
+            // prefer plain_str since if this is set, it is what the user
+            // passed into the request.
+            s
+        } else {
+            match &self.parse_result {
+                // fallback on Url
+                Ok(u) => u.as_str(),
+                // This cannot happen since either we constructed the ParsedUrl
+                // from String, in which case we use that above, or we construct
+                // from Url, in which case we have Ok(url) in parse_result.
+                Err(_) => unreachable!(),
+            }
+        }
+    }
+
+    /// Turn query_params `Cow<String>` to proper `String`
+    fn extract_query_params(mut self) -> Self {
+        if let Ok(url) = &self.parse_result {
+            for (k, v) in url.query_pairs() {
+                self.query_params.push((k.to_string(), v.to_string()));
+            }
+        }
+        self
+    }
+}
+
+impl fmt::Display for ParsedUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<String> for ParsedUrl {
+    fn from(s: String) -> Self {
+        let parse_result = s.parse();
+        ParsedUrl {
+            plain_str: Some(s),
+            parse_result,
+            query_params: vec![],
+        }
+        .extract_query_params()
+    }
+}
+
+impl From<Url> for ParsedUrl {
+    fn from(url: Url) -> Self {
+        ParsedUrl {
+            plain_str: None,
+            parse_result: Ok(url),
+            query_params: vec![],
+        }
+        .extract_query_params()
+    }
 }
 
 /// Request instances are builders that creates a request.
@@ -36,19 +100,10 @@ enum Urlish {
 pub struct Request {
     agent: Agent,
     method: String,
-    url: Urlish,
+    parsed_url: ParsedUrl,
     error_on_non_2xx: bool,
     headers: Vec<Header>,
     query_params: Vec<(String, String)>,
-}
-
-impl fmt::Display for Urlish {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Urlish::Url(u) => write!(f, "{}", u),
-            Urlish::Str(s) => write!(f, "{}", s),
-        }
-    }
 }
 
 impl fmt::Debug for Request {
@@ -56,7 +111,7 @@ impl fmt::Debug for Request {
         write!(
             f,
             "Request({} {} {:?}, {:?})",
-            self.method, self.url, self.query_params, self.headers
+            self.method, self.parsed_url, self.query_params, self.headers
         )
     }
 }
@@ -66,7 +121,7 @@ impl Request {
         Request {
             agent,
             method,
-            url: Urlish::Str(url),
+            parsed_url: url.into(),
             headers: vec![],
             error_on_non_2xx: true,
             query_params: vec![],
@@ -77,7 +132,7 @@ impl Request {
         Request {
             agent,
             method,
-            url: Urlish::Url(url),
+            parsed_url: url.into(),
             headers: vec![],
             error_on_non_2xx: true,
             query_params: vec![],
@@ -105,14 +160,11 @@ impl Request {
         for h in &self.headers {
             h.validate()?;
         }
-        let mut url: Url = match self.url {
-            Urlish::Url(u) => u,
-            Urlish::Str(s) => s.parse().map_err(|e| {
-                ErrorKind::InvalidUrl
-                    .msg(&format!("failed to parse URL: {:?}", e))
-                    .src(e)
-            })?,
-        };
+        let mut url = self.parsed_url.parse_result.map_err(|e| {
+            ErrorKind::InvalidUrl
+                .msg(&format!("failed to parse URL: {:?}", e))
+                .src(e)
+        })?;
         for (name, value) in self.query_params {
             url.query_pairs_mut().append_pair(&name, &value);
         }
@@ -335,6 +387,99 @@ impl Request {
         self.query_params
             .push((param.to_string(), value.to_string()));
         self
+    }
+
+    /// Returns the value of the request method. Something like `GET`, `POST`, `PUT` etc.
+    ///
+    /// ```
+    /// let req = ureq::put("http://httpbin.org/put");
+    ///
+    /// assert_eq!(req.method(), "PUT");
+    /// ```
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// Returns the url of the request.
+    ///
+    /// ```
+    /// let req = ureq::put("http://httpbin.org/put");
+    ///
+    /// assert_eq!(req.url(), "http://httpbin.org/put");
+    /// ```
+    pub fn url(&self) -> &str {
+        self.parsed_url.as_str()
+    }
+
+    /// Helper to get all query parameters both from Url and Request::query
+    fn all_query_params(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.parsed_url
+            // first add query parameters from the url
+            .query_params
+            .iter()
+            // then additional query parameters from Request
+            .chain(self.query_params.iter())
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Returns all the query parameter names.
+    ///
+    /// ```
+    /// // query parameter provided in url
+    /// let mut req = ureq::get("http://httpbin.org/get?foo=bar")
+    ///     // query parameters added on Request
+    ///     .query("foo", "again")
+    ///     .query("baz", "qux");
+    ///
+    /// assert_eq!(req.query_params(), vec![
+    ///    "foo",
+    ///    "baz",
+    /// ]);
+    /// ```
+    pub fn query_params(&self) -> Vec<&str> {
+        let mut ret: Vec<&str> = self.all_query_params().map(|(param, _)| param).collect();
+        ret.dedup();
+        ret
+    }
+
+    /// Returns a query value.
+    ///
+    /// ```
+    /// // query parameter provided in url
+    /// let mut req = ureq::get("http://httpbin.org/get?foo=bar")
+    ///     // query parameter added on Request
+    ///     .query("baz", "qux");
+    ///
+    /// assert_eq!(req.query_value("foo"), Some("bar"));
+    /// assert_eq!(req.query_value("baz"), Some("qux"));
+    /// assert_eq!(req.query_value("corge"), None);
+    /// ```
+    pub fn query_value(&self, param: &str) -> Option<&str> {
+        self.all_query_params()
+            .find(|(k, _)| *k == param)
+            .map(|(_, v)| v)
+    }
+
+    /// Returns all values for a query parameter. This is useful when the same query parameter is
+    /// repeated many times.
+    ///
+    /// ```
+    /// // (repeated) query parameter provided in url
+    /// let mut req = ureq::get("http://httpbin.org/get?foo=bar&foo=baz")
+    ///     // (repeated) query parameter added on Request
+    ///     .query("foo", "qux");
+    ///
+    /// assert_eq!(req.query_values("foo"), vec![
+    ///    "bar",
+    ///    "baz",
+    ///    "qux",
+    /// ]);
+    /// ```
+    pub fn query_values(&self, param: &str) -> Vec<&str> {
+        self.all_query_params()
+            .filter(|(k, _)| *k == param)
+            .map(|(_, v)| v)
+            .collect()
     }
 }
 
